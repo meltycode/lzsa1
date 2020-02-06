@@ -1,0 +1,192 @@
+;
+; LZSA1 decompression routine for Gameboy
+; based on Z80 decompressor by spke (see below)
+;
+; ver. 20190825
+;
+; + No backword.
+; + need 1byte work area(lzsa_tmp).
+; + how to use:
+;    ld hl,LZSA1SourceAddress
+;    ld de,DestinationAddress
+;    call DecompressLZSA
+;--------------------------------------------------------------------------------------------------
+;
+;  Speed-optimized LZSA decompressor by spke (v.1 03-25/04/2019, 110 bytes)
+;
+;  The data must be compressed using the command line compressor by Emmanuel Marty
+;  The compression is done as follows:
+;
+;  lzsa.exe -f1 -r <sourcefile> <outfile>
+;
+;  where option -r asks for the generation of raw (frame-less) data.
+;
+;  The decompression is done in the standard way:
+;
+;  ld hl,FirstByteOfCompressedData
+;  ld de,FirstByteOfMemoryForDecompressedData
+;  call DecompressLZSA
+;
+;  Backward compression is also supported; you can compress files backward using:
+;
+;  lzsa.exe -f1 -r -b <sourcefile> <outfile>
+;
+;  and decompress the resulting files using:
+;
+;  ld hl,LastByteOfCompressedData
+;  ld de,LastByteOfMemoryForDecompressedData
+;  call DecompressLZSA
+;
+;  (do not forget to uncomment the BACKWARD_DECOMPRESS option in the decompressor).
+;
+;  Of course, LZSA compression algorithm is (c) 2019 Emmanuel Marty,
+;  see https://github.com/emmanuel-marty/lzsa for more information
+;
+;  Drop me an email if you have any comments/ideas/suggestions: zxintrospec@gmail.com
+;
+;  This software is provided 'as-is', without any express or implied
+;  warranty.  In no event will the authors be held liable for any damages
+;  arising from the use of this software.
+;
+;  Permission is granted to anyone to use this software for any purpose,
+;  including commercial applications, and to alter it and redistribute it
+;  freely, subject to the following restrictions:
+;
+;  1. The origin of this software must not be misrepresented; you must not
+;     claim that you wrote the original software. If you use this software
+;     in a product, an acknowledgment in the product documentation would be
+;     appreciated but is not required.
+;  2. Altered source versions must be plainly marked as such, and must not be
+;     misrepresented as being the original software.
+;  3. This notice may not be removed or altered from any source distribution.
+
+
+LZSA_LDIR:	MACRO
+	dec			bc
+	inc			b
+	inc			c
+.loop\@:
+	ld			a,[hl+]
+	ld			[de],a
+	inc			de
+	dec			c
+	jr			nz,.loop\@
+	dec			b
+	jr			nz,.loop\@
+	ENDM
+
+
+DecompressLZSA:
+	ld			b,0
+	jr			.ReadToken
+
+.NoLiterals:
+	ld			a,[hl+]
+	bit			7,a
+	push		de
+	ld			e,[hl]
+	inc			hl
+	jr			nz,.LongOffset
+
+											; short matches have length 0+3..14+3
+.ShortOffset:
+	ld			d,$FF
+	add			a,3
+	cp			15+3
+	jr			nc,.LongerMatch
+											; placed here this saves a JP per iteration
+.CopyMatch:
+	ld			c,a
+.CopyMatch_UseC:
+	push		hl
+;	di
+	add			sp,2
+	pop			hl
+	push		hl
+	add			hl,de						;hl=src
+	pop			de							;de=dst
+	add			sp,-4
+;	ei
+	LZSA_LDIR
+	pop			hl
+	pop			af							;dummy
+
+; first a byte token "O|LLL|MMMM" is read from the stream,
+; where LLL is the number of literals and MMMM is
+; a length of the match that follows after the literals
+.ReadToken:
+	ld			a,[hl]
+	and			$70
+	jr			z,.NoLiterals
+
+	cp			$70
+	jr			z,.MoreLiterals				; LLL=7 means 7+ literals...
+	swap		a							; LLL<7 means 0..6 literals...
+
+	ld			c,a
+	ld			a,[hl+]
+	push		af
+	LZSA_LDIR
+	pop			af
+											; next we read the first byte of the offset
+	push		de
+	ld			e,[hl]
+	inc			hl
+	and			a,$8F						; the top bit of token is set if the offset contains two bytes
+	bit			7,a
+	jr			z,.ShortOffset
+
+.LongOffset:								; read second byte of the offset
+	ld			d,[hl]
+	inc			hl
+	add			a,-128+3
+	cp			15+3
+	jr			c,.CopyMatch
+
+											; MMMM=15 indicates a multi-byte number of literals
+.LongerMatch:
+	add			a,[hl]
+	inc			hl
+	jr			nc,.CopyMatch				; the codes are designed to overflow;
+	ld			b,a							; the overflow value 1 means read 1 extra byte
+	ld			a,[hl+]                     ; and overflow value 0 means read 2 extra bytes
+	ld			c,a                         ;.code1:
+	jr			nz,.CopyMatch_UseC
+	ld			a,[hl+]						;.code0:
+	ld			b,a							; the two-byte match length equal to zero
+	or			c							; designates the end-of-data marker
+	jr			nz,.CopyMatch_UseC
+	pop			de
+	ret
+
+.MoreLiterals:								; there are three possible situations here
+	xor			a,[hl]						;$70 xor [hl++]
+	inc			hl
+	ldh			[lzsa_tmp],a
+	ld			a,[hl+]
+	add			a,7
+	jr			c,.ManyLiterals
+
+.CopyLiterals:
+	ld			c,a
+.CopyLiterals_UseC:
+	LZSA_LDIR
+
+	push		de
+	ld			a,[hl+]
+	ld			e,a
+	ldh			a,[lzsa_tmp]
+	bit			7,a
+	jr			z,.ShortOffset
+	jr			.LongOffset
+
+.ManyLiterals:
+	ld			b,a							;.code1:
+	ld			c,[hl]
+	inc			hl
+	jr			nz,.CopyLiterals_UseC
+	ld			a,[hl+]						;.code0:
+	ld			b,a
+	jr			.CopyLiterals_UseC
+
+
